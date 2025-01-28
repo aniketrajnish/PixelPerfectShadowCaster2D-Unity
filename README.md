@@ -23,7 +23,7 @@ Comparison between the following shape providers:
 > [!NOTE]
 > Using the `PolygonCollider2D` as a mediator to set the path of the `ShadowCaster2D` instead of directly applying it as Unity recommends leaving the code within `UnityEngine.Rendering.Universal` untouched!
 
-https://github.com/user-attachments/assets/458180ca-3552-439e-a8fa-b76e4b22a0b3
+https://github.com/user-attachments/assets/81b02867-3772-4d1b-8f52-7e904e977231
 
 ## Contributing
 Contributions to the project are welcome.
