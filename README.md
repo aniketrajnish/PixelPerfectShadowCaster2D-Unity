@@ -9,6 +9,10 @@ Comparison between the following shape providers:
 ![comparision](https://github.com/user-attachments/assets/6381d40f-2a91-44b7-bf5f-2922bb0c8e7b)
 
 ## How To Use
+- Download either:
+  - `PixelPerfectShadowCaster2D.cs` & `PixelPerfectSpritePathCalculator.cs`
+  - latest `.unitypackage` from [Releases](https://github.com/aniketrajnish/PixelPerfectShadowCaster2D-Unity/releases)
+- Import scripts into project
 - Attach this script to a shadow-casting sprite
 - Make sure the sprite has `Read/Write Enabled` in texture import settings
 - Change the `Casting Source` of `ShadowCaster2D` to `Polygon Collider 2D`
