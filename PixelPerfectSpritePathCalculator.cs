@@ -1,334 +1,157 @@
 using UnityEngine;
 using System.Collections.Generic;
-using System.Linq;
 
 namespace Makra.Rendering.Tools
 {
     /// <summary>
-    /// static class to calculate pixel perfect paths for sprites
+    ///   extracts one or more pixel‑perfect outline polygons from a sprite
+    ///   ‑ works entirely in pixel space; the caller can convert to world units
+    ///   ‑ outer contours are clockwise; inner holes are counter‑clockwise
+    ///   ‑ collinear vertices are culled for the smallest possible path
     /// </summary>
     public static class PixelPerfectSpritePathCalculator
     {
-        /// <summary>
-        /// traces the sprite to generate pixel perfect polygons
-        /// </summary>
-        public static Vector2Int[][] TraceSprite(Sprite sprite, float alphaThreshold)
+        ///   any texel with α &lt; threshold is treated as empty</param>
+        /// <returns>
+        ///   an array of polygons; each polygon is an array of <see cref="Vector2Int"/>
+        ///   whose coordinates are in the sprite’s own pixel space
+        ///   (zero in the bottom‑left of <see cref="spriterect"/>)
+        ///   first and last vertex are *not* repeated
+        ///   a <c>null</c> / length‑0 array means “no opaque pixels”
+        /// </returns>
+        public static Vector2Int[][] TraceSprite(Sprite sprite, float alphaThreshold = .5f)
         {
-            if (sprite == null)
-                return new Vector2Int[0][];
+            // --- step 1 -  pull sprite pixels into a bool mask --------------------
+            Rect r          = sprite.rect;
+            int  w          = (int)r.width;
+            int  h          = (int)r.height;
+            int  texWidth   = sprite.texture.width;
+            int  startX     = (int)r.x;
+            int  startY     = (int)r.y;
 
-            Texture2D texture = sprite.texture;
-            RectInt rect = new RectInt((int)sprite.rect.x, (int)sprite.rect.y, (int)sprite.rect.width, (int)sprite.rect.height);
-            Color[] pixelData = texture.GetPixels(rect.x, rect.y, rect.width, rect.height);
-            bool[] solidityMap = new bool[pixelData.Length];
+            Color32[] texels = sprite.texture.GetPixels32();          // full tex
+            bool[,] solid    = new bool[w, h];                        // local mask
 
-            for (int i = 0; i < pixelData.Length; i++)
-                solidityMap[i] = pixelData[i].a > alphaThreshold; // pixel solid if alpha > threshold
-
-            int width = rect.width;
-            int height = rect.height;
-
-            bool currentLineSegmentNull = true;
-            LineSegmentDirection currentLineSegmentDirection = LineSegmentDirection.RIGHT;
-            LineSegment currentLineSegment = new LineSegment();
-            LinkedList<LineSegment> rightLineSegments = new LinkedList<LineSegment>();
-            LinkedList<LineSegment> leftLineSegments = new LinkedList<LineSegment>();
-            LinkedList<LineSegment> upLineSegments = new LinkedList<LineSegment>();
-            LinkedList<LineSegment> downLineSegments = new LinkedList<LineSegment>();
-
-            // ---- horizontal tracing pass ----
-            for (int y = 0; y <= height; y++) // rows -> y columns -> x
+            for (int y = 0; y < h; ++y)
             {
-                for (int x = 0; x < width; x++)
+                int row = texWidth * (startY + y);
+                for (int x = 0; x < w; ++x)
+                    solid[x, y] = texels[row + startX + x].a / 255f >= alphaThreshold;
+            }
+
+            // quick out: fully transparent
+            if (System.Linq.Enumerable.All(solid, b => !b))
+                return System.Array.Empty<Vector2Int[]>();
+
+            // --- step 2 -  march the grid, collecting border edges -------------------
+            var edges = new List<Edge>(w * h);         // rough upper bound
+            for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+            {
+                if (!solid[x, y]) continue;
+
+                //   for every side where the neighbour is empty/out‑of‑bounds
+                //   emit a directed edge that runs clockwise around the pixel
+                //   Pixel (x,y) spans [x,x+1]×[y,y+1] on the grid
+
+                // top
+                if (y == h - 1 || !solid[x, y + 1])
+                    edges.Add(new Edge(new Vector2Int(x,     y + 1),
+                                       new Vector2Int(x + 1, y + 1)));
+                // right
+                if (x == w - 1 || !solid[x + 1, y])
+                    edges.Add(new Edge(new Vector2Int(x + 1, y + 1),
+                                       new Vector2Int(x + 1, y    )));
+                // bottom
+                if (y == 0 || !solid[x, y - 1])
+                    edges.Add(new Edge(new Vector2Int(x + 1, y    ),
+                                       new Vector2Int(x,     y    )));
+                // left
+                if (x == 0 || !solid[x - 1, y])
+                    edges.Add(new Edge(new Vector2Int(x,     y    ),
+                                       new Vector2Int(x,     y + 1)));
+            }
+
+            // --- step 3 -  Stitch edges into closed loops ----------------------------
+            // map: start‑vertex → list of outgoing edge indices
+            var fan = new Dictionary<Vector2Int, List<int>>(edges.Count);
+            for (int i = 0; i < edges.Count; ++i)
+            {
+                if (!fan.TryGetValue(edges[i].a, out var lst))
+                    fan[edges[i].a] = lst = new List<int>(2);
+                lst.Add(i);
+            }
+
+            bool[] used = new bool[edges.Count];
+            var    polys = new List<Vector2Int[]>();
+
+            for (int i = 0; i < edges.Count; ++i)
+            {
+                if (used[i]) continue;
+
+                var path = new List<Vector2Int>(64);
+                int  eIdx     = i;
+                var  start    = edges[eIdx].a;
+                var  curr     = start;
+
+                while (true)
                 {
-                    // check if pixel above (y) and below (y-1) are solid
-                    bool upSideSolid = IsPixelSolidOnMap(x, y, solidityMap, width, height);
-                    bool downSideSolid = IsPixelSolidOnMap(x, y - 1, solidityMap, width, height);
-                    
-                    // case 1: transition from transparenet (above) to solid (below) -- right facing horizontal edge
-                    if (!upSideSolid && downSideSolid)
-                    {
-                        if (currentLineSegmentNull || currentLineSegmentDirection != LineSegmentDirection.RIGHT)
-                        {
-                            CompleteLineSegment(
-                                ref currentLineSegmentNull,
-                                currentLineSegmentDirection,
-                                currentLineSegment,
-                                rightLineSegments,
-                                leftLineSegments,
-                                upLineSegments,
-                                downLineSegments
-                            );
+                    used[eIdx] = true;
+                    path.Add(curr);
 
-                            currentLineSegment.Start = new Vector2Int(x, y);
-                            currentLineSegment.End = new Vector2Int(x + 1, y);
-                            currentLineSegmentDirection = LineSegmentDirection.RIGHT;
-                            currentLineSegmentNull = false;
-                        }
-                        else
-                            currentLineSegment.End = new Vector2Int(currentLineSegment.End.x + 1, currentLineSegment.End.y);
-                        
-                    }
-                    // case 2: transition from solid (above) to transparent (below) -- left facing horizontal edge
-                    else if (upSideSolid && !downSideSolid)
-                    {
-                        if (currentLineSegmentNull || currentLineSegmentDirection != LineSegmentDirection.LEFT)
-                        {
-                            CompleteLineSegment(
-                                ref currentLineSegmentNull,
-                                currentLineSegmentDirection,
-                                currentLineSegment,
-                                rightLineSegments,
-                                leftLineSegments,
-                                upLineSegments,
-                                downLineSegments
-                            );
+                    var nextV = edges[eIdx].b;
+                    if (nextV == start) break;           // closed the ring
 
-                            currentLineSegment.Start = new Vector2Int(x + 1, y);
-                            currentLineSegment.End = new Vector2Int(x, y);
-                            currentLineSegmentDirection = LineSegmentDirection.LEFT;
-                            currentLineSegmentNull = false;
-                        }
-                        else
-                            currentLineSegment.Start = new Vector2Int(currentLineSegment.Start.x + 1, currentLineSegment.Start.y);
+                    // pick next unused edge that starts at nextV
+                    if (!fan.TryGetValue(nextV, out var candidates))
+                        break;                           // should not happen (open edge)
 
-                    }
-                    // case 3: no transition -- complete any pending line segment
-                    else
-                    {
-                        CompleteLineSegment(
-                            ref currentLineSegmentNull,
-                            currentLineSegmentDirection,
-                            currentLineSegment,
-                            rightLineSegments,
-                            leftLineSegments,
-                            upLineSegments,
-                            downLineSegments
-                        );
-                    }
+                    int nxt = -1;
+                    foreach (int c in candidates)
+                        if (!used[c]) { nxt = c; break; }
+
+                    if (nxt < 0) break;                  // isolated cusp (also rare)
+                    eIdx = nxt;
+                    curr = nextV;
+                }
+
+                if (path.Count >= 3)
+                {
+                    CullCollinear(path);
+                    if (path.Count >= 3)
+                        polys.Add(path.ToArray());
                 }
             }
-            // complete any pending line segment after horizontal traicing
-            CompleteLineSegment(
-                ref currentLineSegmentNull,
-                currentLineSegmentDirection,
-                currentLineSegment,
-                rightLineSegments,
-                leftLineSegments,
-                upLineSegments,
-                downLineSegments
-            );
 
-            // ---- horizontal tracing pass ----
-            for (int x = 0; x <= width; x++)
-            {
-                for (int y = 0; y < height; y++)
-                {
-                    // check if pixel to the right (x) and left (x-1) are solid
-                    bool rightSideSolid = IsPixelSolidOnMap(x, y, solidityMap, width, height);
-                    bool leftSideSolid = IsPixelSolidOnMap(x - 1, y, solidityMap, width, height);
-
-                    // case 1: transition from transparenet (left) to solid (right) -- up facing vertical edge
-                    if (rightSideSolid && !leftSideSolid)
-                    {
-                        if (currentLineSegmentNull || currentLineSegmentDirection != LineSegmentDirection.UP)
-                        {
-                            CompleteLineSegment(
-                                ref currentLineSegmentNull,
-                                currentLineSegmentDirection,
-                                currentLineSegment,
-                                rightLineSegments,
-                                leftLineSegments,
-                                upLineSegments,
-                                downLineSegments
-                            );
-
-                            currentLineSegment.Start = new Vector2Int(x, y);
-                            currentLineSegment.End = new Vector2Int(x, y + 1);
-                            currentLineSegmentDirection = LineSegmentDirection.UP;
-                            currentLineSegmentNull = false;
-                        }
-                        else
-                            currentLineSegment.End = new Vector2Int(currentLineSegment.End.x, currentLineSegment.End.y + 1);
-                        
-                    }
-                    // case 2: transition from solid (left) to transparent (right) -- down facing vertical edge
-                    else if (!rightSideSolid && leftSideSolid)
-                    {
-                        if (currentLineSegmentNull || currentLineSegmentDirection != LineSegmentDirection.DOWN)
-                        {
-                            CompleteLineSegment(
-                                ref currentLineSegmentNull,
-                                currentLineSegmentDirection,
-                                currentLineSegment,
-                                rightLineSegments,
-                                leftLineSegments,
-                                upLineSegments,
-                                downLineSegments
-                            );
-
-                            currentLineSegment.Start = new Vector2Int(x, y + 1);
-                            currentLineSegment.End = new Vector2Int(x, y);
-                            currentLineSegmentDirection = LineSegmentDirection.DOWN;
-                            currentLineSegmentNull = false;
-                        }
-                        else
-                            currentLineSegment.Start = new Vector2Int(currentLineSegment.Start.x, currentLineSegment.Start.y + 1);
-                        
-                    }
-                    // case 3: no transition -- complete any pending line segment
-                    else
-                    {
-                        CompleteLineSegment(
-                            ref currentLineSegmentNull,
-                            currentLineSegmentDirection,
-                            currentLineSegment, rightLineSegments,
-                            leftLineSegments,
-                            upLineSegments,
-                            downLineSegments
-                        );
-                    }
-                }
-            }
-            // complete any pending line segment after vertical traicing
-            CompleteLineSegment(
-                ref currentLineSegmentNull,
-                currentLineSegmentDirection,
-                currentLineSegment,
-                rightLineSegments,
-                leftLineSegments,
-                upLineSegments,
-                downLineSegments
-            );
-
-
-            LinkedList<Vector2Int[]> polygons = new LinkedList<Vector2Int[]>();
-
-            // ---- polygon construction pass ----
-            // iterate over all line segments and construct polygons
-            while (leftLineSegments.Count + rightLineSegments.Count + upLineSegments.Count + downLineSegments.Count > 0)
-            {
-                LinkedList<Vector2Int> currentPolygon = new LinkedList<Vector2Int>();
-                currentPolygon.AddFirst(rightLineSegments.First.Value.Start);
-                currentPolygon.AddLast(rightLineSegments.First.Value.End);
-                rightLineSegments.RemoveFirst();
-                LineSegmentDirection lastLineSegmentDirection = LineSegmentDirection.RIGHT;
-
-                while (currentPolygon.First.Value != currentPolygon.Last.Value)
-                    AddLineSegment(
-                        currentPolygon, 
-                        ref lastLineSegmentDirection, 
-                        rightLineSegments, 
-                        leftLineSegments, 
-                        upLineSegments, 
-                        downLineSegments
-                    );
-                
-                currentPolygon.RemoveLast();
-                polygons.AddLast(currentPolygon.ToArray());
-            }
-            return polygons.ToArray();
+            return polys.ToArray();
         }
 
 
-        private static bool IsPixelSolidOnMap(int x, int y, bool[] solidityMap, int width, int height) =>
-            // check if a pixel is solid on the solidity map
-            !(x < 0 || y < 0 || x >= width || y >= height) && solidityMap[(y * width) + x];
+        // ---------- helpers ----------------------------------------------------
 
-
-        private static void CompleteLineSegment(
-            ref bool currentLineSegmentNull,
-            LineSegmentDirection currentLineSegmentDirection,
-            LineSegment currentLineSegment,
-            LinkedList<LineSegment> rightLineSegments,
-            LinkedList<LineSegment> leftLineSegments,
-            LinkedList<LineSegment> upLineSegments,
-            LinkedList<LineSegment> downLineSegments
-        )
+        private struct Edge
         {
-            if (currentLineSegmentNull)
-            {
-                return;
-            }
-            LinkedList<LineSegment> segmentsList = currentLineSegmentDirection switch
-            {
-                LineSegmentDirection.RIGHT => rightLineSegments,
-                LineSegmentDirection.LEFT => leftLineSegments,
-                LineSegmentDirection.UP => upLineSegments,
-                LineSegmentDirection.DOWN => downLineSegments,
-                _ => null,
-            };
-            segmentsList?.AddLast(currentLineSegment);
-            currentLineSegmentNull = true;
-        }
-        private static void AddLineSegment(
-            LinkedList<Vector2Int> partialPolygon,
-            ref LineSegmentDirection lastLineSegmentDirection,
-            LinkedList<LineSegment> rightLineSegments,
-            LinkedList<LineSegment> leftLineSegments,
-            LinkedList<LineSegment> upLineSegments,
-            LinkedList<LineSegment> downLineSegments
-        )
-        {
-            // add line segment to the partial polygon being constructed
-            if (lastLineSegmentDirection == LineSegmentDirection.RIGHT)
-            {
-                if (_AddLineSegment(partialPolygon, downLineSegments)) { lastLineSegmentDirection = LineSegmentDirection.DOWN; return; }
-                if (_AddLineSegment(partialPolygon, upLineSegments)) { lastLineSegmentDirection = LineSegmentDirection.UP; return; }
-            }
-            else if (lastLineSegmentDirection == LineSegmentDirection.LEFT)
-            {
-                if (_AddLineSegment(partialPolygon, upLineSegments)) { lastLineSegmentDirection = LineSegmentDirection.UP; return; }
-                if (_AddLineSegment(partialPolygon, downLineSegments)) { lastLineSegmentDirection = LineSegmentDirection.DOWN; return; }
-            }
-            else if (lastLineSegmentDirection == LineSegmentDirection.UP)
-            {
-                if (_AddLineSegment(partialPolygon, rightLineSegments)) { lastLineSegmentDirection = LineSegmentDirection.RIGHT; return; }
-                if (_AddLineSegment(partialPolygon, leftLineSegments)) { lastLineSegmentDirection = LineSegmentDirection.LEFT; return; }
-            }
-            else if (lastLineSegmentDirection == LineSegmentDirection.DOWN)
-            {
-                if (_AddLineSegment(partialPolygon, leftLineSegments)) { lastLineSegmentDirection = LineSegmentDirection.LEFT; return; }
-                if (_AddLineSegment(partialPolygon, rightLineSegments)) { lastLineSegmentDirection = LineSegmentDirection.RIGHT; return; }
-            }
+            public Vector2Int a, b;
+            public Edge(Vector2Int a, Vector2Int b) { this.a = a; this.b = b; }
         }
 
-        /// <summary>
-        /// adds a line segment to the partial polygon if it connects
-        /// </summary>
-        private static bool _AddLineSegment(LinkedList<Vector2Int> partialPolygon, LinkedList<LineSegment> lineSegments)
+        /// <summary>Removes vertices that fall on a straight line.</summary>
+        private static void CullCollinear(List<Vector2Int> p)
         {
-            Vector2Int lastPointInPolygon = partialPolygon.Last.Value;
-            for (LinkedListNode<LineSegment> node = lineSegments.First; node != null; node = node.Next)
+            int i = 0;
+            while (p.Count >= 3 && i < p.Count)
             {
-                if (node.Value.Start == lastPointInPolygon)
-                {
-                    partialPolygon.AddLast(node.Value.End);
-                    lineSegments.Remove(node);
-                    return true;
-                }
+                Vector2Int prev = p[(i - 1 + p.Count) % p.Count];
+                Vector2Int curr = p[i];
+                Vector2Int next = p[(i + 1) % p.Count];
+
+                var  v1 = curr - prev;
+                var  v2 = next - curr;
+                long cross = (long)v1.x * v2.y - (long)v1.y * v2.x;
+
+                if (cross == 0) p.RemoveAt(i);          // collinear ⇒ drop
+                else            ++i;
             }
-            return false;
-        }
-    }
-
-    // --- Helper Structs and Enums ---
-    public enum LineSegmentDirection : byte
-    {
-        RIGHT,
-        LEFT,
-        UP,
-        DOWN,
-    }
-
-    public struct LineSegment
-    {
-        public Vector2Int Start;
-        public Vector2Int End;
-        public LineSegment(Vector2Int start, Vector2Int end)
-        {
-            Start = start;
-            End = end;
         }
     }
 }
