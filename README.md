@@ -32,4 +32,4 @@ Contributions to the project are welcome.
 MIT
 
 ## Acknowledgement
-Thankful to [RandomiaGaming](https://github.com/RandomiaGaming) for Contour Tracing Algorithm.
+Thankful to O3 for Contour Tracing Algorithm.
